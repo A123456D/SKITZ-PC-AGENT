@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { encodeInputLine } from './input-protocol.mjs'
 import { SMTC_SCRIPT, VOLUME_SCRIPT } from './system-scripts.mjs'
 
-const VERSION = '1.7.0'
+const VERSION = '1.7.1'
 const PROTOCOL = 1
 const DEFAULT_PORT = 8787
 const PLAT = platform()
@@ -1092,9 +1092,17 @@ function pumpMirror(data) {
     mirror.buffer = mirror.buffer.subarray(4 + len)
     const targets = mirror.clients.size ? mirror.clients : [...sockets].filter((c) => c.authed)
     for (const client of targets) {
-      if (client.mirrorPaused) continue
+      if (client.mirrorPaused) {
+        // Backpressured: keep only the NEWEST frame so the client resumes at
+        // "now" instead of bursting through a stale backlog (jitter source).
+        client.mirrorNext = jpeg
+        continue
+      }
       try {
-        if (sendFrame(client, 0x2, jpeg) === false) client.mirrorPaused = true
+        if (sendFrame(client, 0x2, jpeg) === false) {
+          client.mirrorPaused = true
+          client.mirrorNext = jpeg
+        }
       } catch {
         mirror.clients.delete(client)
       }
@@ -1157,10 +1165,19 @@ httpServer.on('upgrade', (req, socket) => {
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
   )
   socket.setNoDelay(true)
-  const client = { socket, buffer: Buffer.alloc(0), authed: false, mirrorPaused: false }
+  const client = { socket, buffer: Buffer.alloc(0), authed: false, mirrorPaused: false, mirrorNext: null }
   sockets.add(client)
   socket.on('drain', () => {
     client.mirrorPaused = false
+    const jpeg = client.mirrorNext
+    client.mirrorNext = null
+    if (jpeg) {
+      try {
+        if (sendFrame(client, 0x2, jpeg) === false) client.mirrorPaused = true
+      } catch {
+        /* socket went away */
+      }
+    }
   })
 
   socket.on('data', (chunk) => {
