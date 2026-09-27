@@ -1,6 +1,6 @@
-# SKITZ PC Agent
+# Mouse & Keys Agent
 
-Companion helper for **[Skitz Pc Controller](https://skitz-games.pages.dev/pc/)** (Android).
+Companion helper for **[Skitz Mouse & Keys](https://skitz-games.pages.dev/pc/)** (Android).
 Run it on your Windows or Linux PC to give the phone app its Wi-Fi touchpad, keyboard,
 power, and shortcut controls on the same network.
 
@@ -19,12 +19,12 @@ stays in the notification area. Right-click the tray icon → Stop to quit.
 Windows SmartScreen may warn on first run (the binary is unsigned) — choose
 *More info → Run anyway*.
 
-**Linux:** extract the tar.gz and run `Install SKITZ PC Agent.sh`. Bundled Node runtime;
+**Linux:** extract the tar.gz and run `Install Mouse & Keys Agent.sh`. Bundled Node runtime;
 the GUI needs Python 3 (preinstalled on most distros).
 
 ## Pair
 
-On the phone: Pc Controller → **Agent** tab → **Find PC** → type the PIN shown in the
+On the phone: Mouse & Keys → **Agent** tab → **Find PC** → type the PIN shown in the
 helper window. After pairing, the agent reconnects automatically and self-updates from
 the SKITZ site.
 
