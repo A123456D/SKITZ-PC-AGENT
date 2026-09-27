@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { encodeInputLine } from './input-protocol.mjs'
 import { SMTC_SCRIPT, VOLUME_SCRIPT } from './system-scripts.mjs'
 
-const VERSION = '1.7.1'
+const VERSION = '1.7.2'
 const PROTOCOL = 1
 const DEFAULT_PORT = 8787
 const PLAT = platform()
