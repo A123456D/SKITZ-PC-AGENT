@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { encodeInputLine } from './input-protocol.mjs'
 import { SMTC_SCRIPT, VOLUME_SCRIPT } from './system-scripts.mjs'
 
-const VERSION = '1.6.1'
+const VERSION = '1.7.0'
 const PROTOCOL = 1
 const DEFAULT_PORT = 8787
 const PLAT = platform()
@@ -611,8 +611,7 @@ const COMMANDS = {
     const windows = PLAT === 'win32' ? await windowTitles() : []
     return { ok: true, smtc, windows }
   },
-  async 'media-seek'(arg) {
-    const v = String(arg ?? '').trim()
+  async 'media-seek'(arg) {    const v = String(arg ?? '').trim()
     if (!/^[-+]?\d{1,6}(\.\d{1,2})?$/.test(v)) return { ok: false, error: 'Seek: seconds, or +N/-N for delta' }
     const r = await smtcViaExe(['seek', v])
     if (!r) return { ok: false, error: 'Seek needs SkitzMedia.exe (SMTC helper) — not available' }
@@ -626,6 +625,25 @@ const COMMANDS = {
     if (Number.isFinite(r.duration)) smtc.duration = r.duration
     if (Number.isFinite(r.rate)) smtc.rate = r.rate
     return { ok: true, smtc }
+  },
+  'mirror-start'(arg) {
+    if (PLAT !== 'win32') return { ok: false, error: 'Screen mirror is Windows-only' }
+    if (!existsSync(MIRROR_EXE)) return { ok: false, error: 'Mirror helper missing — repack the agent' }
+    let opts = {}
+    try {
+      opts = JSON.parse(String(arg ?? '{}')) ?? {}
+    } catch {
+      opts = {}
+    }
+    const width = Math.max(480, Math.min(1920, Math.round(Number(opts.width) || 1280)))
+    const quality = Math.max(30, Math.min(85, Math.round(Number(opts.quality) || 60)))
+    const fps = Math.max(2, Math.min(15, Math.round(Number(opts.fps) || 8)))
+    startMirrorChild(width, quality, Math.round(1000 / fps))
+    return { ok: true, width, quality, fps }
+  },
+  'mirror-stop'() {
+    stopMirror()
+    return { ok: true }
   },
   volume(arg) {
     if (arg === undefined || arg === null || arg === '') {
@@ -1039,6 +1057,82 @@ async function executeCommand(body) {
   }
 }
 
+// ——— Screen mirror: SkitzMirror.exe stdout (framed JPEG) → WS binary frames ———
+
+const MIRROR_EXE = join(AGENT_DIR, 'SkitzMirror.exe')
+const mirror = { child: null, clients: new Set(), buffer: Buffer.alloc(0) }
+
+function stopMirror() {
+  if (mirror.child) {
+    const child = mirror.child
+    mirror.child = null
+    try {
+      child.kill()
+    } catch {
+      /* already gone */
+    }
+  }
+  mirror.buffer = Buffer.alloc(0)
+  for (const client of [...mirror.clients]) {
+    try {
+      sendFrame(client, 0x1, JSON.stringify({ type: 'mirror', event: 'stop' }))
+    } catch {
+      /* socket went away */
+    }
+  }
+  mirror.clients.clear()
+}
+
+function pumpMirror(data) {
+  mirror.buffer = Buffer.concat([mirror.buffer, data])
+  while (mirror.buffer.length >= 4) {
+    const len = mirror.buffer.readUInt32LE(0)
+    if (len < 2 || len > 8_000_000 || mirror.buffer.length < 4 + len) break
+    const jpeg = mirror.buffer.subarray(4, 4 + len)
+    mirror.buffer = mirror.buffer.subarray(4 + len)
+    const targets = mirror.clients.size ? mirror.clients : [...sockets].filter((c) => c.authed)
+    for (const client of targets) {
+      if (client.mirrorPaused) continue
+      try {
+        if (sendFrame(client, 0x2, jpeg) === false) client.mirrorPaused = true
+      } catch {
+        mirror.clients.delete(client)
+      }
+    }
+  }
+  if (mirror.buffer.length > 16_000_000) mirror.buffer = Buffer.alloc(0) // corrupt stream guard
+}
+
+function startMirrorChild(width, quality, intervalMs) {
+  stopMirror()
+  const child = spawn(MIRROR_EXE, [String(width), String(quality), String(intervalMs)], {
+    stdio: ['ignore', 'pipe', 'ignore'],
+    windowsHide: true,
+  })
+  mirror.child = child
+  child.stdout.on('data', pumpMirror)
+  child.on('exit', () => {
+    if (mirror.child === child) {
+      mirror.child = null
+      mirror.buffer = Buffer.alloc(0)
+      for (const client of mirror.clients) {
+        try {
+          sendFrame(client, 0x1, JSON.stringify({ type: 'mirror', event: 'stop' }))
+        } catch {
+          /* socket went away */
+        }
+      }
+      mirror.clients.clear()
+    }
+  })
+  child.on('error', () => {
+    if (mirror.child === child) {
+      mirror.child = null
+      mirror.clients.clear()
+    }
+  })
+}
+
 // ——— WebSocket at /ws (RFC6455, just enough for JSON control messages) ———
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
@@ -1063,8 +1157,11 @@ httpServer.on('upgrade', (req, socket) => {
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
   )
   socket.setNoDelay(true)
-  const client = { socket, buffer: Buffer.alloc(0), authed: false }
+  const client = { socket, buffer: Buffer.alloc(0), authed: false, mirrorPaused: false }
   sockets.add(client)
+  socket.on('drain', () => {
+    client.mirrorPaused = false
+  })
 
   socket.on('data', (chunk) => {
     client.buffer = Buffer.concat([client.buffer, chunk])
@@ -1083,10 +1180,12 @@ httpServer.on('upgrade', (req, socket) => {
   socket.on('close', () => {
     clearInterval(heartbeat)
     sockets.delete(client)
+    mirror.clients.delete(client)
   })
   socket.on('error', () => {
     clearInterval(heartbeat)
     sockets.delete(client)
+    mirror.clients.delete(client)
   })
 
   function dropClient(c, why) {
@@ -1147,8 +1246,8 @@ httpServer.on('upgrade', (req, socket) => {
   }
 })
 
-function sendFrame(client, opcode, text) {
-  const payload = Buffer.from(text, 'utf8')
+function sendFrame(client, opcode, data) {
+  const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8')
   const len = payload.length
   let header
   if (len < 126) {
@@ -1164,7 +1263,7 @@ function sendFrame(client, opcode, text) {
     header[1] = 127
     header.writeBigUInt64BE(BigInt(len), 2)
   }
-  client.socket.write(Buffer.concat([header, payload]))
+  return client.socket.write(Buffer.concat([header, payload]))
 }
 
 function wsSend(client, obj) {
