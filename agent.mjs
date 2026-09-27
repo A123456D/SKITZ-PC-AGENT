@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { encodeInputLine } from './input-protocol.mjs'
 import { SMTC_SCRIPT, VOLUME_SCRIPT } from './system-scripts.mjs'
 
-const VERSION = '1.6.0'
+const VERSION = '1.6.1'
 const PROTOCOL = 1
 const DEFAULT_PORT = 8787
 const PLAT = platform()
@@ -577,25 +577,55 @@ const COMMANDS = {
   async media() {
     let smtc = null
     if (PLAT === 'win32') {
-      try {
-        const r = await run('powershell.exe', psEncoded(SMTC_SCRIPT))
-        const parsed = JSON.parse(r.out || '[]')
-        const sessions = Array.isArray(parsed) ? parsed : [parsed]
-        const clean = sessions
-          .map((s) => ({
-            app: String(s?.app ?? ''),
-            title: String(s?.title ?? ''),
-            artist: String(s?.artist ?? ''),
-            status: String(s?.status ?? '').toLowerCase(),
-          }))
-          .filter((s) => s.title)
-        smtc = clean.find((s) => s.status === 'playing') ?? clean[0] ?? null
-      } catch {
-        smtc = null
+      const viaExe = await smtcViaExe(['get'])
+      if (viaExe && String(viaExe.title ?? '').trim()) {
+        smtc = {
+          app: String(viaExe.app ?? ''),
+          title: String(viaExe.title ?? ''),
+          artist: String(viaExe.artist ?? ''),
+          status: String(viaExe.status ?? '').toLowerCase(),
+        }
+        if (Number.isFinite(viaExe.position)) smtc.position = viaExe.position
+        if (Number.isFinite(viaExe.duration)) smtc.duration = viaExe.duration
+        if (Number.isFinite(viaExe.rate)) smtc.rate = viaExe.rate
+      }
+      if (!smtc) {
+        try {
+          const r = await run('powershell.exe', psEncoded(SMTC_SCRIPT))
+          const parsed = JSON.parse(r.out || '[]')
+          const sessions = Array.isArray(parsed) ? parsed : [parsed]
+          const clean = sessions
+            .map((s) => ({
+              app: String(s?.app ?? ''),
+              title: String(s?.title ?? ''),
+              artist: String(s?.artist ?? ''),
+              status: String(s?.status ?? '').toLowerCase(),
+            }))
+            .filter((s) => s.title)
+          smtc = clean.find((s) => s.status === 'playing') ?? clean[0] ?? null
+        } catch {
+          smtc = null
+        }
       }
     }
     const windows = PLAT === 'win32' ? await windowTitles() : []
     return { ok: true, smtc, windows }
+  },
+  async 'media-seek'(arg) {
+    const v = String(arg ?? '').trim()
+    if (!/^[-+]?\d{1,6}(\.\d{1,2})?$/.test(v)) return { ok: false, error: 'Seek: seconds, or +N/-N for delta' }
+    const r = await smtcViaExe(['seek', v])
+    if (!r) return { ok: false, error: 'Seek needs SkitzMedia.exe (SMTC helper) — not available' }
+    const smtc = {
+      app: String(r.app ?? ''),
+      title: String(r.title ?? ''),
+      artist: String(r.artist ?? ''),
+      status: String(r.status ?? '').toLowerCase(),
+    }
+    if (Number.isFinite(r.position)) smtc.position = r.position
+    if (Number.isFinite(r.duration)) smtc.duration = r.duration
+    if (Number.isFinite(r.rate)) smtc.rate = r.rate
+    return { ok: true, smtc }
   },
   volume(arg) {
     if (arg === undefined || arg === null || arg === '') {
@@ -653,6 +683,22 @@ const COMMANDS = {
 }
 
 const AGENT_DIR = dirname(fileURLToPath(import.meta.url))
+const MEDIA_EXE = join(AGENT_DIR, 'SkitzMedia.exe')
+
+// Real SMTC state (position/duration/seek) via the compiled SkitzMedia.exe
+// helper (pack-windows builds it when the Windows SDK is present). Returns
+// the parsed session JSON, or null when absent/failing — callers fall back.
+async function smtcViaExe(argv) {
+  if (PLAT !== 'win32' || !existsSync(MEDIA_EXE)) return null
+  const r = await run(MEDIA_EXE, argv)
+  if (!r.ok) return null
+  try {
+    const parsed = JSON.parse(r.out)
+    return parsed && parsed.ok ? parsed : null
+  } catch {
+    return null
+  }
+}
 const INPUT_DRY = process.env.SKITZ_INPUT_DRY === '1'
 let inputChild = null
 let inputAccX = 0
