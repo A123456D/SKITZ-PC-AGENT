@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Mouse & Keys Agent — companion service for the Mouse & Keys phone app.
+// SKITZ PC Agent — companion service for the Pc Controller phone app.
 //
 // Runs on the desktop PC. Gives the phone (same Wi-Fi) three things Bluetooth
 // HID alone cannot do:
@@ -22,13 +22,14 @@ import { createSocket as createUdpSocket } from 'node:dgram'
 import { execFile, spawn } from 'node:child_process'
 import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { networkInterfaces, hostname, uptime, platform, release } from 'node:os'
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, readdirSync, statSync, createReadStream, createWriteStream } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { encodeInputLine } from './input-protocol.mjs'
+import { SMTC_SCRIPT, VOLUME_SCRIPT } from './system-scripts.mjs'
 
-const VERSION = '1.4.7'
+const VERSION = '1.6.0'
 const PROTOCOL = 1
 const DEFAULT_PORT = 8787
 const PLAT = platform()
@@ -163,6 +164,12 @@ function launchWin(entry) {
   if (entry.type === 'app-or-web') {
     return launchWinStartAppOrUrl(entry.name, entry.url)
   }
+  if (entry.type === 'appid') {
+    // Path/name comes from our own Start-Menu scan, never from the network.
+    // FileProtocolHandler runs the .lnk; explorer.exe + lnk is unreliable
+    // when spawned detached from a service-like context.
+    return runDetached('rundll32.exe', ['url.dll,FileProtocolHandler', entry.appid])
+  }
   if (entry.type === 'url') {
     return runDetached('rundll32.exe', ['url.dll,FileProtocolHandler', entry.target])
   }
@@ -255,6 +262,218 @@ function launchUnix(entry) {
   return Promise.resolve({ ok: false, error: 'Unknown app' })
 }
 
+// ——— Installed-app enumeration (Start Menu / Applications folder) ———
+// The phone may pin any of these by exact name; launching resolves through
+// this table only, so network input never reaches a shell.
+
+let appCache = { at: 0, apps: [] }
+
+const APP_NAME_SAFE = /^[^"\\\r\n]{1,60}$/
+const APP_NAME_NOISE = /^(uninstall|readme|help|license|documentation|about|release notes)/i
+
+/** Start-Menu shortcut scan — names stay on this machine and never reach a shell. */
+function listWinApps() {
+  const roots = [
+    join(process.env.ProgramData ?? 'C:\\ProgramData', 'Microsoft', 'Windows', 'Start Menu', 'Programs'),
+    join(process.env.AppData ?? join(homedir(), 'AppData', 'Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs'),
+  ]
+  const out = []
+  const seen = new Set()
+  const visit = (dir, depth) => {
+    if (depth > 6) return
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue
+      const path = join(dir, e.name)
+      if (e.isDirectory()) visit(path, depth + 1)
+      else if (/\.(lnk|url)$/i.test(e.name)) {
+        const name = e.name.replace(/\.(lnk|url)$/i, '').trim()
+        if (!name || seen.has(name.toLowerCase()) || !APP_NAME_SAFE.test(name)) continue
+        if (APP_NAME_NOISE.test(name)) continue
+        seen.add(name.toLowerCase())
+        out.push({ name, appid: path })
+      }
+    }
+  }
+  for (const root of roots) visit(root, 0)
+  return out.slice(0, 400)
+}
+
+async function listUnixApps() {
+  if (PLAT === 'darwin') {
+    const r = await run('sh', ['-c', "ls /Applications ~/Applications 2>/dev/null | grep -i '\\.app$' | head -300"])
+    if (!r.ok) return []
+    return r.detail
+      .split('\n')
+      .map((line) => line.trim().replace(/\.app$/i, ''))
+      .filter((name) => name && APP_NAME_SAFE.test(name))
+      .map((name) => ({ name, appid: name }))
+  }
+  // Linux: .desktop launcher ids (gtk-launch understands these directly).
+  const ids = await run('sh', ['-c', "ls /usr/share/applications ~/.local/share/applications 2>/dev/null | grep '\\.desktop$' | head -300"])
+  if (!ids.ok) return []
+  const seen = new Set()
+  const out = []
+  for (const id of ids.detail.split('\n')) {
+    const name = id.trim().replace(/\.desktop$/i, '')
+    if (!name || !APP_NAME_SAFE.test(name) || seen.has(name)) continue
+    seen.add(name)
+    out.push({ name, appid: name })
+  }
+  return out
+}
+
+async function installedApps() {
+  const now = Date.now()
+  if (now - appCache.at < 10 * 60_000) return appCache.apps
+  const apps = PLAT === 'win32' ? listWinApps() : await listUnixApps()
+  if (apps.length) appCache = { at: now, apps }
+  return apps
+}
+
+/** Exact-name lookup (case-insensitive) against the enumerated table. */
+async function resolveApp(name) {
+  const wanted = String(name ?? '').trim()
+  if (!wanted || wanted.length > 60) return null
+  const apps = await installedApps()
+  const hit = apps.find((a) => a.name.toLowerCase() === wanted.toLowerCase())
+  if (!hit) return null
+  if (PLAT === 'win32') return { type: 'appid', appid: hit.appid }
+  if (PLAT === 'darwin') return { type: 'darwin-app', name: hit.appid }
+  return { type: 'desktop-id', name: hit.appid }
+}
+
+// ——— Media window title (best-effort now-playing fallback) ———
+
+const MEDIA_WINDOW_CAP = 15
+
+async function windowTitles() {
+  if (PLAT !== 'win32') return []
+  const r = await run('powershell.exe', [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `Get-Process | Where-Object { $_.MainWindowTitle } | Select-Object -First ${MEDIA_WINDOW_CAP} ProcessName, MainWindowTitle | ConvertTo-Json -Compress`,
+  ])
+  if (!r.ok) return []
+  try {
+    const parsed = JSON.parse(r.out || r.detail)
+    const rows = Array.isArray(parsed) ? parsed : [parsed]
+    return rows
+      .map((row) => ({ app: String(row?.ProcessName ?? ''), title: String(row?.MainWindowTitle ?? '') }))
+      .filter((w) => w.app && w.title)
+  } catch {
+    return []
+  }
+}
+
+function parseVolume(r) {
+  try {
+    const parsed = JSON.parse(r.out || '{}')
+    return {
+      ok: true,
+      volume: Number.isFinite(parsed?.volume) ? Math.max(0, Math.min(100, Math.round(parsed.volume))) : null,
+      mute: typeof parsed?.mute === 'boolean' ? parsed.mute : null,
+    }
+  } catch {
+    return { ok: false, volume: null, mute: null, error: 'Volume read failed' }
+  }
+}
+
+
+// ——— File transfer (phone <-> PC, fixed safe roots only) ———
+
+const FILE_ROOTS = {
+	downloads: () => join(process.env.USERPROFILE ?? homedir(), 'Downloads'),
+	desktop: () => join(process.env.USERPROFILE ?? homedir(), 'Desktop'),
+	documents: () => join(process.env.USERPROFILE ?? homedir(), 'Documents'),
+	pictures: () => join(process.env.USERPROFILE ?? homedir(), 'Pictures'),
+	music: () => join(process.env.USERPROFILE ?? homedir(), 'Music'),
+	videos: () => join(process.env.USERPROFILE ?? homedir(), 'Videos'),
+}
+
+const FILE_CAP = 500 // entries per listing
+const DOWNLOAD_TOKENS = new Map() // token -> { path, at }
+const UPLOAD_TOKENS = new Map() // token -> { name, at }
+
+function listFolder(key) {
+	const rootFn = FILE_ROOTS[key]
+	if (!rootFn) return null
+	let entries
+	try {
+		entries = readdirSync(rootFn(), { withFileTypes: true })
+	} catch {
+		return []
+	}
+	const out = []
+	for (const e of entries) {
+		if (e.name.startsWith('.')) continue
+		let size = 0
+		if (!e.isDirectory()) {
+			try {
+				size = statSync(join(rootFn(), e.name)).size
+			} catch {
+				continue
+			}
+		}
+		out.push({ name: e.name, dir: e.isDirectory(), size })
+		if (out.length >= FILE_CAP) break
+	}
+	out.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1))
+	return out
+}
+
+function sweepTokens() {
+	const now = Date.now()
+	for (const [t, v] of DOWNLOAD_TOKENS) if (now - v.at > 90_000) DOWNLOAD_TOKENS.delete(t)
+	for (const [t, v] of UPLOAD_TOKENS) if (now - v.at > 90_000) UPLOAD_TOKENS.delete(t)
+}
+
+function resolveDownload(token) {
+	sweepTokens()
+	const hit = DOWNLOAD_TOKENS.get(String(token ?? ''))
+	if (!hit) return null
+	DOWNLOAD_TOKENS.delete(String(token ?? ''))
+	return hit.value
+}
+
+function uploadTarget(name) {
+	const clean = String(name ?? '')
+		.replace(/[^\w. ()\[\]-]+/g, '_')
+		.replace(/^_+|_+$/g, '')
+		.slice(0, 120)
+	if (!clean || clean.startsWith('_')) return null
+	return join(FILE_ROOTS.downloads(), clean)
+}
+
+
+// ——— Windows helper scripts (PowerShell, base64-encoded to dodge quoting) ———
+
+function psEncoded(script) {
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-EncodedCommand',
+    Buffer.from(script, 'utf16le').toString('base64'),
+  ]
+}
+
+function runVolume(action, pct) {
+  let script = VOLUME_SCRIPT
+  if (action === 'set') script += `[Vol]::Set(${pct}, -1) | ConvertTo-Json -Compress\n`
+  else if (action === 'mute') script += `[Vol]::Set(-1, 1) | ConvertTo-Json -Compress\n`
+  else if (action === 'unmute') script += `[Vol]::Set(-1, 0) | ConvertTo-Json -Compress\n`
+  else script += `[Vol]::Get() | ConvertTo-Json -Compress\n`
+  return run('powershell.exe', psEncoded(script))
+}
+
+const CLIPBOARD_CAP = 10_000
+
 const COMMANDS = {
   status() {
     return { ok: true, ...systemStatus() }
@@ -307,8 +526,117 @@ const COMMANDS = {
   },
   launch(arg) {
     const entry = LAUNCH_MAP[String(arg ?? '')]
-    if (!entry) return Promise.resolve({ ok: false, error: `Unknown app "${arg ?? ''}"` })
-    return PLAT === 'win32' ? launchWin(entry) : launchUnix(entry)
+    if (entry) return PLAT === 'win32' ? launchWin(entry) : launchUnix(entry)
+    // Not a curated tile — allow exact-name launch from the enumerated table.
+    return resolveApp(arg).then((resolved) => {
+      if (!resolved) return Promise.resolve({ ok: false, error: `Unknown app "${String(arg ?? '').slice(0, 40)}"` })
+      if (PLAT === 'win32') return launchWin(resolved)
+      if (resolved.type === 'darwin-app') return runDetached('open', ['-a', resolved.name])
+      return runFirst([
+        ['gtk-launch', [resolved.name]],
+        ['xdg-open', [resolved.name]],
+      ])
+    })
+  },
+  apps() {
+    return installedApps().then((apps) => ({ ok: true, apps, count: apps.length }))
+  },
+  files(arg) {
+		const key = String(arg ?? 'downloads').trim().toLowerCase()
+		if (!FILE_ROOTS[key]) return { ok: false, error: 'Unknown folder' }
+		const entries = listFolder(key)
+		return { ok: true, folder: key, files: entries, count: entries.length }
+	},
+	'file-token'(arg) {
+		let req = {}
+		try { req = JSON.parse(String(arg ?? '{}')) } catch { }
+		const key = String(req.folder ?? 'downloads').toLowerCase()
+		if (!FILE_ROOTS[key]) return { ok: false, error: 'Unknown folder' }
+		const name = String(req.name ?? '')
+		if (!name || name.includes('/') || name.includes('\\') || name.startsWith('.')) {
+			return { ok: false, error: 'Bad file name' }
+		}
+		const abs = join(FILE_ROOTS[key](), name)
+		if (!abs.startsWith(FILE_ROOTS[key]())) return { ok: false, error: 'Bad path' }
+		let size = 0
+		try { size = statSync(abs).size } catch { return { ok: false, error: 'File not found' } }
+		const token = randomBytes(24).toString('hex')
+		DOWNLOAD_TOKENS.set(token, { value: abs, at: Date.now() })
+		sweepTokens()
+		return { ok: true, url: '/file?token=' + token, name, size }
+	},
+	'upload-token'(arg) {
+		const target = uploadTarget(arg)
+		if (!target) return { ok: false, error: 'Bad file name' }
+		const token = randomBytes(24).toString('hex')
+		UPLOAD_TOKENS.set(token, { target, at: Date.now() })
+		sweepTokens()
+		return { ok: true, token, name: target.split('\\').pop() }
+	},
+
+  async media() {
+    let smtc = null
+    if (PLAT === 'win32') {
+      try {
+        const r = await run('powershell.exe', psEncoded(SMTC_SCRIPT))
+        const parsed = JSON.parse(r.out || '[]')
+        const sessions = Array.isArray(parsed) ? parsed : [parsed]
+        const clean = sessions
+          .map((s) => ({
+            app: String(s?.app ?? ''),
+            title: String(s?.title ?? ''),
+            artist: String(s?.artist ?? ''),
+            status: String(s?.status ?? '').toLowerCase(),
+          }))
+          .filter((s) => s.title)
+        smtc = clean.find((s) => s.status === 'playing') ?? clean[0] ?? null
+      } catch {
+        smtc = null
+      }
+    }
+    const windows = PLAT === 'win32' ? await windowTitles() : []
+    return { ok: true, smtc, windows }
+  },
+  volume(arg) {
+    if (arg === undefined || arg === null || arg === '') {
+      return runVolume('get').then((r) => parseVolume(r))
+    }
+    const text = String(arg).trim()
+    if (/^mute$/i.test(text)) return runVolume('mute').then((r) => parseVolume(r))
+    if (/^unmute$/i.test(text)) return runVolume('unmute').then((r) => parseVolume(r))
+    if (/^toggle$/i.test(text)) {
+      return runVolume('get').then((cur) => {
+        const v = parseVolume(cur)
+        return runVolume(v.mute ? 'unmute' : 'mute').then((r) => parseVolume(r))
+      })
+    }
+    const pct = Number(text)
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) return { ok: false, error: 'Volume: 0-100, mute, unmute, toggle' }
+    return runVolume('set', Math.round(pct)).then((r) => parseVolume(r))
+  },
+  clipboard(arg) {
+    if (arg === undefined || arg === null || arg === '') {
+      if (PLAT === 'win32') {
+        return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard -Raw']).then((r) => {
+          const text = (r.out || '').slice(0, CLIPBOARD_CAP)
+          return { ok: r.ok, text: text || null }
+        })
+      }
+      if (PLAT === 'darwin') {
+        return run('pbpaste', []).then((r) => {
+          const text = (r.out || '').slice(0, CLIPBOARD_CAP)
+          return { ok: r.ok, text: text || null }
+        })
+      }
+      return { ok: false, error: 'Clipboard read needs Windows or macOS' }
+    }
+    const text = String(arg)
+    if (text.length > CLIPBOARD_CAP) return { ok: false, error: 'Clipboard text too long (10k cap)' }
+    if (PLAT !== 'win32') return { ok: false, error: 'Clipboard write is Windows-only right now' }
+    const b64 = Buffer.from(text, 'utf8').toString('base64')
+    return run('powershell.exe', psEncoded(
+      `$t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))\nSet-Clipboard -Value $t`,
+    )).then((r) => ({ ok: r.ok, error: r.ok ? undefined : 'Set-Clipboard failed' }))
   },
   start() {
     if (PLAT === 'win32') {
@@ -412,8 +740,12 @@ function applyPointerInput(msg) {
 
 function run(file, argv) {
   return new Promise((resolve) => {
-    execFile(file, argv, { windowsHide: true, timeout: 8000 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, detail: err ? String(stderr || err.message).slice(0, 200) : String(stdout || '').slice(0, 200) })
+    execFile(file, argv, { windowsHide: true, timeout: 8000, maxBuffer: 4_000_000 }, (err, stdout, stderr) => {
+      resolve({
+        ok: !err,
+        out: String(stdout || '').slice(0, 400_000),
+        detail: err ? String(stderr || err.message).slice(0, 200) : String(stdout || '').slice(0, 200),
+      })
     })
   })
 }
@@ -440,7 +772,71 @@ function runDetached(file, argv) {
   })
 }
 
-// ——— HTTP: /health landing + REST fallback (pair/cmd) ———
+// ——— HTTP: /health landing + /pair QR page + REST fallback (pair/cmd) ———
+
+let qrLibCache = null
+function qrLib() {
+  if (qrLibCache === null) {
+    try {
+      qrLibCache = readFileSync(join(AGENT_DIR, 'qrcode.min.js'), 'utf8')
+    } catch {
+      qrLibCache = ''
+    }
+  }
+  return qrLibCache
+}
+
+/** Page the PC opens in a browser: scan it with the phone camera to pair. */
+function pairPage() {
+  const ips = lanAddresses()
+  const pin = pendingPins.has(pairingPin) ? pairingPin : null
+  const links = ips
+    .map((ip) => `skitz://pair?host=${encodeURIComponent(ip)}&port=${PORT}${pin ? `&pin=${pin}` : ''}`)
+    
+  const script = qrLib()
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PC Agent — pair</title>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0d0e; color: #eef4f2;
+         display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 24px; }
+  .card { background: #101416; border: 1px solid rgba(255,255,255,.1); border-radius: 20px; padding: 30px; max-width: 460px; }
+  .brand { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+  .seed { width: 9px; height: 9px; border-radius: 3px; background: #4dd0bd; box-shadow: 0 0 9px rgba(77,208,189,.45); }
+  .brand b { font-size: 1rem; } .brand span { color: #96a5a2; font-size: 1rem; }
+  h1 { font-size: .68rem; letter-spacing: .18em; color: #62706d; margin: 18px 0 4px; font-weight: 600; }
+  .pin { font-family: Consolas, monospace; font-size: 2.4rem; font-weight: 700; letter-spacing: .08em; }
+  p { color: #96a5a2; font-size: .85rem; line-height: 1.5; margin: 10px 0; }
+  .qr { background: #fff; padding: 16px; border-radius: 14px; display: inline-block; margin: 12px 0; }
+  .qr svg { display: block; }
+  a { color: #7ce4d4; text-decoration: none; } a:hover { text-decoration: underline; }
+  code { color: #4dd0bd; }
+  .alt { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,.08); }
+  .cap { font-size: .64rem; letter-spacing: .14em; color: #62706d; }
+</style></head><body>
+<div class="card">
+  <div class="brand"><span class="seed"></span><b>PC</b><span>Agent</span></div>
+  <h1>PAIR WITH YOUR PHONE</h1>
+  ${pin ? `<div class="pin">${pin}</div>
+  <p>Open the phone's camera and point it at this code — it opens
+  <b>Pc Controller</b> and pairs by itself. Inside the app: Agent → Find PC also works with this PIN.</p>` : '<p>No pairing PIN is pending right now — restart the agent to pair a new phone. A phone that paired before reconnects automatically.</p>'}
+  <div class="qr" id="qr"></div>
+  <p class="cap">THIS PC · agent v${VERSION} · ${HOSTNAME}</p>
+  <div class="alt">
+    <p class="cap">OTHER NETWORKS ON THIS PC — TAP IF YOU'RE ON THE PHONE:</p>
+    ${links.map((l, i) => `<p><a href="${l}">${l.replace('skitz://pair?', '')}</a></p>`).join('')}
+  </div>
+</div>
+<script>${script}</script>
+<script>
+  var links = ${JSON.stringify(links)};
+  var qr = qrcode(0, 'M');
+  qr.addData(links[0] || 'skitz://pair');
+  qr.make();
+  document.getElementById('qr').innerHTML = qr.createSvgTag({ cellSize: 4, margin: 0 });
+</script>
+</body></html>`
+}
 
 const httpServer = createServer((req, res) => {
   const url = new URL(req.url, 'http://local')
@@ -459,6 +855,74 @@ const httpServer = createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, agent: 'skitz-pc-agent', ...systemStatus() }))
     return
   }
+
+  if (req.method === 'GET' && url.pathname === '/pair') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.end(pairPage())
+    return
+  }
+
+  if (req.method === 'GET' && url.pathname === '/file') {
+		const abs = resolveDownload(url.searchParams.get('token'))
+		if (!abs) {
+			res.statusCode = 403
+			res.end(JSON.stringify({ ok: false, error: 'Invalid or expired token' }))
+			return
+		}
+		let size = 0
+		try {
+			size = statSync(abs).size
+		} catch {
+			res.statusCode = 404
+			res.end(JSON.stringify({ ok: false, error: 'File gone' }))
+			return
+		}
+		res.setHeader('Content-Type', 'application/octet-stream')
+		res.setHeader('Content-Length', String(size))
+		const safe = basename(abs).replace(/"/g, '')
+		res.setHeader('Content-Disposition', 'attachment; filename="' + safe + '"')
+		createReadStream(abs).pipe(res)
+		log('file download:', safe, size + 'B')
+		return
+	}
+
+	if (req.method === 'POST' && url.pathname === '/upload') {
+		// Bearer token (paired app) OR a one-time upload token both authorize.
+		const auth = String(req.headers.authorization ?? '')
+		const bearerOk = auth === 'Bearer ' + TRUSTED_TOKEN
+		const minted = UPLOAD_TOKENS.get(String(url.searchParams.get('token') ?? ''))
+		if (!bearerOk && !minted) {
+			res.statusCode = 401
+			res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }))
+			return
+		}
+		const nameParam = bearerOk ? url.searchParams.get('name') : minted.name
+		const target = uploadTarget(nameParam)
+		if (!target) {
+			res.statusCode = 400
+			res.end(JSON.stringify({ ok: false, error: 'Bad file name' }))
+			return
+		}
+		if (minted) UPLOAD_TOKENS.delete(String(url.searchParams.get('token')))
+		const cap = 500 * 1024 * 1024
+		let received = 0
+		req.on('data', (chunk) => {
+			received += chunk.length
+			if (received > cap) req.destroy()
+		})
+		const ws = createWriteStream(target)
+		req.pipe(ws)
+		ws.on('finish', () => {
+			res.end(JSON.stringify({ ok: true, name: target.split('\\').pop(), size: received }))
+			log('upload:', target.split('\\').pop(), received + 'B')
+		})
+		ws.on('error', () => {
+			res.statusCode = 500
+			res.end(JSON.stringify({ ok: false, error: 'Write failed' }))
+		})
+		return
+	}
+
 
   if (req.method === 'POST' && url.pathname === '/pair') {
     let body = ''
@@ -750,12 +1214,12 @@ function startSsdp() {
 
 // ——— Boot ———
 
-process.title = 'Mouse & Keys Agent'
+process.title = 'PC Agent'
 
 httpServer.on('error', (err) => {
   if (err && err.code === 'EADDRINUSE') {
     console.log('')
-    console.log('  Mouse & Keys Agent is already running (port ' + PORT + ' is in use).')
+    console.log('  PC Agent is already running (port ' + PORT + ' is in use).')
     console.log('  Look for it in the notification area, or stop the other copy first.')
     console.log('')
     process.exit(0)
@@ -768,8 +1232,8 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   writeRuntime()
   const ips = lanAddresses()
   console.log('')
-  console.log('  Mouse & Keys Agent')
-  console.log('  Phone: Mouse & Keys → Agent tab → Find PC → PIN.')
+  console.log('  PC Agent')
+  console.log('  Phone: Pc Controller → Agent tab → Find PC → PIN.')
   console.log('')
   log(`v${VERSION} · ${PLAT} · port ${PORT}`)
   for (const ip of ips) log(`  ${ip}`)
