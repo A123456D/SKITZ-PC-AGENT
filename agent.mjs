@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { encodeInputLine } from './input-protocol.mjs'
 import { SMTC_SCRIPT, VOLUME_SCRIPT } from './system-scripts.mjs'
 
-const VERSION = '1.7.2'
+const VERSION = '1.7.3'
 const PROTOCOL = 1
 const DEFAULT_PORT = 8787
 const PLAT = platform()
@@ -588,6 +588,7 @@ const COMMANDS = {
         if (Number.isFinite(viaExe.position)) smtc.position = viaExe.position
         if (Number.isFinite(viaExe.duration)) smtc.duration = viaExe.duration
         if (Number.isFinite(viaExe.rate)) smtc.rate = viaExe.rate
+        if (typeof viaExe.shuffle === 'boolean') smtc.shuffle = viaExe.shuffle
       }
       if (!smtc) {
         try {
