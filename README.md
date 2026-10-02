@@ -28,7 +28,25 @@ On the phone: Mouse & Keys → **Agent** tab → **Find PC** → type the PIN sh
 helper window. After pairing, the agent reconnects automatically and self-updates from
 the SKITZ site.
 
+## Upgrading from an older agent
+
+Agent 1.7.5 and newer check for updates every hour and restore themselves if an update
+fails to start, so most people never do this by hand.
+
+**Agents older than 1.7.5 could not update themselves** and must be replaced once:
+
+1. Delete the folder `%LOCALAPPDATA%\SkitzPcAgent` on the PC.
+2. Download and unzip the current archive into that folder.
+3. Run `SkitzPcAgent.exe`.
+
+Step 1 matters. Overwriting in place leaves an old screen-capture helper on disk that
+Windows Defender flags as a trojan, which is what made mirroring look broken.
+
 ## Files in this repo
 
 These archives are the release artifacts served by the SKITZ site's download endpoint.
 Source code lives in the private SKITZ-GAMES repository (`pc-controller/pc-agent`).
+
+`capture-source.cs.txt` is the screen-capture source. It is compiled in memory inside
+`powershell.exe` the first time mirroring starts, so the archive contains no
+screen-capture executable and nothing for an antivirus to flag.

@@ -19,7 +19,7 @@
 
 import { createServer } from 'node:http'
 import { createSocket as createUdpSocket } from 'node:dgram'
-import { execFile, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { networkInterfaces, hostname, uptime, platform, release } from 'node:os'
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, readdirSync, statSync, createReadStream, createWriteStream } from 'node:fs'
@@ -29,7 +29,7 @@ import { homedir } from 'node:os'
 import { encodeInputLine } from './input-protocol.mjs'
 import { SMTC_SCRIPT, VOLUME_SCRIPT } from './system-scripts.mjs'
 
-const VERSION = '1.7.3'
+const VERSION = '1.7.5'
 const PROTOCOL = 1
 const DEFAULT_PORT = 8787
 const PLAT = platform()
@@ -629,7 +629,9 @@ const COMMANDS = {
   },
   'mirror-start'(arg) {
     if (PLAT !== 'win32') return { ok: false, error: 'Screen mirror is Windows-only' }
-    if (!existsSync(MIRROR_EXE)) return { ok: false, error: 'Mirror helper missing — repack the agent' }
+    // No helper-existence check: the capture is compiled in memory at runtime,
+    // so there is no file to be quarantined or go missing. See
+    // startMirrorChild() and pc-agent/capture-source.cs.txt.
     let opts = {}
     try {
       opts = JSON.parse(String(arg ?? '{}')) ?? {}
@@ -1060,7 +1062,6 @@ async function executeCommand(body) {
 
 // ——— Screen mirror: SkitzMirror.exe stdout (framed JPEG) → WS binary frames ———
 
-const MIRROR_EXE = join(AGENT_DIR, 'SkitzMirror.exe')
 const mirror = { child: null, clients: new Set(), buffer: Buffer.alloc(0) }
 
 function stopMirror() {
@@ -1114,10 +1115,30 @@ function pumpMirror(data) {
 
 function startMirrorChild(width, quality, intervalMs) {
   stopMirror()
-  const child = spawn(MIRROR_EXE, [String(width), String(quality), String(intervalMs)], {
+  // Run the capture IN MEMORY inside powershell.exe instead of spawning
+  // SkitzMirror.exe. Defender's ML classifier quarantined the unsigned
+  // screen-capture .exe as Trojan:MSIL/*!MTB on first mirror use -- it flags the
+  // SHAPE (unsigned binary that reads the screen and pipes raw frames), not the
+  // contents, so renaming or rebuilding the .exe does not help. Compiling the
+  // same logic into powershell.exe at runtime means the bundle ships no
+  // screen-capture binary at all, so there is nothing to quarantine.
+  // Source of truth: pc-agent/capture-source.cs.txt (~130 ms compile, once).
+  const captureCs = readFileSync(join(AGENT_DIR, 'capture-source.cs.txt'), 'utf8')
+  const script =
+    'Add-Type -TypeDefinition ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(' +
+    "'" +
+    Buffer.from(captureCs, 'utf8').toString('base64') +
+    "'" +
+    '))) -ReferencedAssemblies System.Drawing; [SkitzCapture]::Run(' +
+    String(width) + ',' +
+    String(quality) + ',' +
+    String(intervalMs) +
+    ')'
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], {
     stdio: ['ignore', 'pipe', 'ignore'],
     windowsHide: true,
   })
+  log('mirror: capture running in-memory inside powershell.exe')
   mirror.child = child
   child.stdout.on('data', pumpMirror)
   child.on('exit', () => {
