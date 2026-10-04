@@ -106,6 +106,13 @@ export function encodeInputLine(msg, plat = process.platform) {
     if (!dx && !dy) return null
     return `m ${dx} ${dy}`
   }
+  if (op === 'abs') {
+    // Absolute position as fractions 0..1 of the screen (screen-mirror taps).
+    const xf = Number(msg.x)
+    const yf = Number(msg.y)
+    if (!Number.isFinite(xf) || !Number.isFinite(yf)) return null
+    return `a ${clamp(xf * 10000, 0, 10000)} ${clamp(yf * 10000, 0, 10000)}`
+  }
   if (op === 'button') {
     const btn = BUTTON[msg.button]
     if (btn === undefined) return null
